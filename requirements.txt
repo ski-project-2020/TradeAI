@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+joblib
+os
+plotly
+re
+StandardScaler
+IsolationForest
+Network
