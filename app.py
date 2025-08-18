@@ -4,10 +4,8 @@ import numpy as np
 import joblib
 import os
 import plotly.express as px
-import plotly.graph_objects as go
 import re
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import IsolationForest
 from pyvis.network import Network
 import streamlit.components.v1 as components
 
@@ -18,13 +16,12 @@ st.set_page_config(page_title="SAPU TANGAN by TradeAI", layout="wide", page_icon
 st.markdown("""
 <style>
     header {visibility: hidden;}
-    /* Reduce margin above the sidebar header */
-    .st-emotion-cache-16txtl3 { margin-top: -75px; }
-    /* Move the logo up */
-    .st-emotion-cache-1v0mbdj { margin-top: -50px; }
     @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
     html, body, [class*="st-"] { font-family: 'Roboto', sans-serif; }
     .main { background-color: #f0f2f5; }
+    [data-testid="stSidebar"] > div:first-child {
+        overflow: hidden !important;
+    }
     .st-emotion-cache-18ni7ap { background-color: #005FAC; border-bottom: 5px solid #FAB715; }
     .stButton>button { border: 2px solid #FAB715; border-radius: 5px; background-color: #FAB715; color: #005FAC; font-weight: bold; }
     .stButton>button:hover { background-color: #ffffff; color: #005FAC; border: 2px solid #005FAC; }
@@ -101,7 +98,8 @@ def run_single_transaction_analysis(inputs):
 
     try:
         model_f1 = resources['models_flag_1'][id_kelompok]
-        harga_scaled = model_f1['scaler'].transform([[inputs['harga_satuan']]])
+        harga_df = pd.DataFrame([inputs['harga_satuan']], columns=['harga_satuan'])
+        harga_scaled = model_f1['scaler'].transform(harga_df)
         flag_if = 1 if model_f1['isolation_forest'].predict(harga_scaled)[0] == -1 else 0
         flag_iqr = 1 if not (model_f1['iqr_bounds']['lower'] <= inputs['harga_satuan'] <= model_f1['iqr_bounds']['upper']) else 0
         results['flag_1'] = {"is_anomaly": bool(flag_if and flag_iqr), "detail": f"IF: {bool(flag_if)}, IQR: {bool(flag_iqr)}"}
@@ -122,7 +120,7 @@ def run_single_transaction_analysis(inputs):
     else:
         results['flag_6'] = {"is_risky": False, "detail": "Pemasok tidak masuk profil berisiko."}
 
-    rute = f"{inputs['negara_asal']} -> {inputs['pelabuhan_bongkar']}"
+    rute = f"{inputs['negara_asal']} -> {inputs['pelabuhan_masuk']}"
     profil_rute = resources['profil_risiko_rute']
     route_risk = profil_rute[profil_rute['rute_perdagangan'] == rute]
     if not route_risk.empty and route_risk.iloc[0]['flag_rute_mencurigakan'] == 1:
@@ -137,27 +135,26 @@ def run_full_analysis(inputs):
     results = run_single_transaction_analysis(inputs)
 
     try:
-        deskripsi_bersih = bersihkan_teks(inputs['uraian'])
-        vektor = resources['vectorizer'].transform([deskripsi_bersih])
-        id_kelompok = resources['kmeans'].predict(vektor)[0]
-        model_f2 = resources['models_flag_2'][id_kelompok]
+        model_f2 = resources['models_flag_2']
+        rasio = inputs.get('nilai_invoice', 0) / (inputs.get('netto_barang', 1) + 1e-6)
+        rasio_df = pd.DataFrame([rasio], columns=['rasio_invoice_netto'])
+        scaler = StandardScaler()
+        rasio_scaled = scaler.fit_transform(rasio_df)
         
-        rasio = inputs.get('harga_invoice', 0) / (inputs.get('netto', 1) + 1e-6)
-        rasio_scaled = model_f2['scaler'].transform([[rasio]])
-        is_anomaly_f2 = model_f2['isolation_forest'].predict(rasio_scaled)[0] == -1
+        is_anomaly_f2 = model_f2.predict(rasio_scaled)[0] == -1
         results['flag_2'] = {"is_anomaly": is_anomaly_f2, "detail": f"Rasio Invoice/Netto: {rasio:.2f}"}
     except (KeyError, ZeroDivisionError):
         results['flag_2'] = {"is_anomaly": False, "detail": "Tidak dapat menghitung risiko Phantom Shipping."}
 
     try:
-       results['flag_3'] = {"is_anomaly": False, "detail": "Analisis Smurfing memerlukan pra-pemrosesan data batch."}
+       results['flag_3'] = {"is_anomaly": False, "detail": "Analisis Smurfing memerlukan proses data batch."}
     except Exception:
-        results['flag_3'] = {"is_anomaly": False, "detail": "Error pada analisis Smurfing."}
+        results['flag_3'] = {"is_anomaly": False, "detail": "Error pada Analisis Smurfing."}
 
     try:
-        results['flag_4'] = {"is_anomaly": False, "detail": "Analisis Trantib memerlukan data historis."}
+        results['flag_4'] = {"is_anomaly": False, "detail": "Analisis Pergeseran Perilaku memerlukan data historis."}
     except Exception:
-        results['flag_4'] = {"is_anomaly": False, "detail": "Error pada analisis Trantib."}
+        results['flag_4'] = {"is_anomaly": False, "detail": "Error pada Analisis Pergeseran Perilaku."}
 
     return results
 
@@ -165,7 +162,8 @@ def run_batch_analysis(df):
     if not resources:
         st.error("Model tidak dimuat.")
         return pd.DataFrame()
-    df['tanggal'] = pd.to_datetime(df['tanggal'])
+        
+    df['tanggal'] = pd.to_datetime(df['tanggal'], errors='coerce')
     smurfing_agg = df.groupby(['tanggal', 'importir', 'deskripsi_barang']).agg(
         freq=('importir', 'count'),
         mean_val=('nilai_invoice', 'mean'),
@@ -173,10 +171,9 @@ def run_batch_analysis(df):
     ).reset_index()
     smurfing_agg['std_val'] = smurfing_agg['std_val'].fillna(0)
 
-    # --- Pra-pemrosesan untuk Flag 4 (Trantib) ---
-    df_sorted = df.sort_values(by=['importir', 'deskripsi_barang', 'tanggal'])
+    df_sorted = df.sort_values(by=['tanggal', 'importir', 'deskripsi_barang'])
     df_sorted['baseline_netto'] = df_sorted.groupby(['importir', 'deskripsi_barang'])['netto_barang'].expanding().mean().reset_index(level=[0,1], drop=True)
-    df_sorted['deviasi_netto'] = (df_sorted['netto_barang'] - df_sorted['baseline_netto']) / (df_sorted['baseline_netto'] + 1e-6)
+    df_sorted['deviasi_netto'] = df_sorted['netto_barang'] / (df_sorted['baseline_netto'] + 1e-6)
     
     results_list = []
     for index, row in df_sorted.iterrows():
@@ -193,9 +190,11 @@ def run_batch_analysis(df):
         ]
         if not smurfing_check.empty:
             try:
-                smurfing_features = smurfing_check[['freq', 'mean_val', 'std_val']].values
+                smurfing_features = smurfing_check[['importir', 'tanggal']].values
                 model_f3 = resources['models_flag_3']
-                is_anomaly_f3 = model_f3['isolation_forest'].predict(smurfing_features)[0] == -1
+                scaler = StandardScaler()
+                smurfing_features_scaled = scaler.fit_transform(smurfing_features)
+                is_anomaly_f3 = model_f3.predict(smurfing_features_scaled)[0] == -1
                 row['flag_3'] = 1 if is_anomaly_f3 else 0
             except Exception:
                 row['flag_3'] = 0
@@ -203,9 +202,14 @@ def run_batch_analysis(df):
             row['flag_3'] = 0
 
         try:
-            model_f4 = resources['models_flag_4']
-            is_anomaly_f4 = model_f4['isolation_forest'].predict([[row['deviasi_netto']]])[0] == -1
-            row['flag_4'] = 1 if is_anomaly_f4 else 0
+            if (row['importir'], row['deskripsi_barang']) in resources['models_flag_4']:
+                model_f4 = resources['models_flag_4'][(row['importir'], row['deskripsi_barang'])]
+                is_anomaly_f4 = model_f4.predict([[row['deviasi_netto']]])[0] == -1
+                row['flag_4'] = 1 if is_anomaly_f4 else 0
+            else:
+                row['flag_4'] = 1 if row['deviasi_netto'] > 1.8 else 0
+        except (AttributeError, TypeError):
+            row['flag_4'] = 1 if row['deviasi_netto'] > 1.8 else 0
         except Exception:
             row['flag_4'] = 0
 
@@ -220,14 +224,13 @@ def run_batch_analysis(df):
 resources = load_resources()
 
 with st.sidebar:
-    st.image("TradeAI_Logo.png", use_container_width=True)
+    st.image("TradeAI_Logo.png")
     st.header("Navigasi Portal")
     app_mode = st.radio(
         "Pilih Layanan:",
         ["Home", "Analisis Batch", "Analisis Transaksional", "Profil Risiko", "Modeling"],
         label_visibility="collapsed"
     )
-    st.divider()
     st.info("SAPU TANGAN v1.0")
 
 main_container = st.container()
@@ -310,13 +313,13 @@ with main_container:
         uploaded_file = st.file_uploader("Pilih file CSV", type="csv")
         
         if uploaded_file is not None:
-            df_upload = pd.read_csv(uploaded_file)
+            df_upload = pd.read_csv(uploaded_file, sep=';')
             st.success(f"Berhasil memuat **{len(df_upload)} baris**. Klik tombol di bawah untuk memulai.")
             
             if st.button("Proses File Batch", use_container_width=True):
                 with st.spinner("Menganalisis seluruh data menggunakan model..."):
                     # Pastikan kolom yang dibutuhkan ada
-                    required_cols = ['importir', 'nama_pemasok', 'deskripsi_barang', 'nilai_invoice', 'negara_asal', 'pelabuhan_bongkar', 'tanggal', 'netto_barang']
+                    required_cols = ['importir', 'nama_pemasok', 'deskripsi_barang', 'nilai_invoice', 'negara_asal', 'pelabuhan_masuk', 'tanggal', 'netto_barang']
                     if not all(col in df_upload.columns for col in required_cols):
                         st.error(f"File yang diunggah harus berisi kolom berikut: {', '.join(required_cols)}")
                     else:
@@ -338,7 +341,7 @@ with main_container:
                 col1.metric("Anomali Harga", f"{total_f1} Kasus")
                 col2.metric("Phantom Shipping", f"{total_f2} Kasus")
                 col3.metric("Smurfing", f"{total_f3} Kasus")
-                col4.metric("Anomali Trantib", f"{total_f4} Kasus")
+                col4.metric("Anomali Pergeseran Perilaku", f"{total_f4} Kasus")
                 
                 st.divider()
 
@@ -351,8 +354,9 @@ with main_container:
                         'Anomali Harga': total_f1,
                         'Phantom Shipping': total_f2,
                         'Smurfing': total_f3,
-                        'Anomali Trantib': total_f4
+                        'Anomali Pergeseran Perilaku': total_f4
                     }
+
                     df_anomaly_dist = pd.DataFrame(list(anomaly_counts.items()), columns=['Jenis Anomali', 'Jumlah Kasus'])
                     fig_pie = px.pie(df_anomaly_dist, names='Jenis Anomali', values='Jumlah Kasus',
                                      title='Proporsi Jenis Anomali yang Terdeteksi',
@@ -364,17 +368,28 @@ with main_container:
                     col_viz1, col_viz2 = st.columns(2)
                     with col_viz1:
                         st.markdown("##### Top 10 Importir Berisiko")
-                        top_importir = df_result[(df_result['flag_1'] == 1) | (df_result.get('flag_2', 0) == 1) | (df_result.get('flag_4', 0) == 1)]['importir'].value_counts().nlargest(10)
-                        st.bar_chart(top_importir)
+                        df_anomalies_for_charts = df_result[(df_result['flag_1'] == 1) | (df_result.get('flag_2', 0) == 1) | (df_result.get('flag_3', 0) == 1) | (df_result.get('flag_4', 0) == 1)]
+                        if not df_anomalies_for_charts.empty:
+                            top_importir = df_anomalies_for_charts['importir'].value_counts().nlargest(10).sort_values()
+                            fig_importir = px.bar(top_importir, x=top_importir.values, y=top_importir.index, orientation='h', labels={'x': 'Jumlah Kasus', 'y': 'Importir'})
+                            fig_importir.update_layout(showlegend=False)
+                            st.plotly_chart(fig_importir, use_container_width=True)
+                        else:
+                            st.info("Tidak ada importir berisiko untuk ditampilkan.")
                     
                     with col_viz2:
                         st.markdown("##### Top 10 Negara Asal Berisiko")
-                        top_countries = df_result[(df_result['flag_1'] == 1) | (df_result.get('flag_2', 0) == 1) | (df_result.get('flag_4', 0) == 1)]['negara_asal'].value_counts().nlargest(10)
-                        st.bar_chart(top_countries)
+                        if not df_anomalies_for_charts.empty:
+                            top_countries = df_anomalies_for_charts['negara_asal'].value_counts().nlargest(10).sort_values()
+                            fig_countries = px.bar(top_countries, x=top_countries.values, y=top_countries.index, orientation='h', labels={'x': 'Jumlah Kasus', 'y': 'Negara Asal'})
+                            fig_countries.update_layout(showlegend=False)
+                            st.plotly_chart(fig_countries, use_container_width=True)
+                        else:
+                            st.info("Tidak ada negara asal berisiko untuk ditampilkan.")
 
                 with viz_tab2:
                     st.subheader("Jaringan Importir dan Pemasok Terindikasi Anomali")
-                    df_anomalies_for_graph = df_result[(df_result['flag_1'] == 1) | (df_result.get('flag_2', 0) == 1) | (df_result.get('flag_4', 0) == 1)]
+                    df_anomalies_for_graph = df_result[(df_result['flag_1'] == 1) | (df_result.get('flag_2', 0) == 1) | (df_result.get('flag_3', 0) == 1) | (df_result.get('flag_4', 0) == 1)]
                     
                     if 'nama_pemasok' in df_anomalies_for_graph.columns:
                         with st.spinner("Membangun grafik jaringan..."):
@@ -420,7 +435,7 @@ with main_container:
                         "deskripsi_barang": uraian_input,
                         "harga_satuan": harga_input,
                         "negara_asal": negara_input,
-                        "pelabuhan_bongkar": pelabuhan_input
+                        "pelabuhan_masuk": pelabuhan_input
                     }
                     with st.spinner("Menganalisis transaksi..."):
                         analysis_result = run_single_transaction_analysis(inputs)
@@ -488,11 +503,11 @@ with main_container:
                 st.metric("Jumlah Importir Berisiko Tinggi", len(df_mencurigakan_importir))
                 st.dataframe(df_mencurigakan_importir, use_container_width=True)
                 
-                st.subheader("Jaringan 5 Importir Paling Berisiko dan Pemasok Terkait")
-                df_top5_importir = df_mencurigakan_importir.head(5)
+                st.subheader("Jaringan 10 Importir Paling Berisiko dan Pemasok Terkait")
+                df_top_importir = df_mencurigakan_importir.head(10)
                 
-                if not df_top5_importir.empty:
-                    top_importir_names = df_top5_importir['importir'].tolist()
+                if not df_top_importir.empty:
+                    top_importir_names = df_top_importir['importir'].tolist()
                     df_source = resources['df_source']
                     df_filtered = df_source[df_source['importir'].isin(top_importir_names)]
                     
@@ -517,11 +532,11 @@ with main_container:
                 st.metric("Jumlah Pemasok Berisiko Tinggi", len(df_mencurigakan_pemasok))
                 st.dataframe(df_mencurigakan_pemasok, use_container_width=True)
                 
-                st.subheader("Jaringan 5 Pemasok Paling Berisiko dan Importir Terkait")
-                df_top5_pemasok = df_mencurigakan_pemasok.head(5)
+                st.subheader("Jaringan 10 Pemasok Paling Berisiko dan Importir Terkait")
+                df_top_pemasok = df_mencurigakan_pemasok.head(10)
 
-                if not df_top5_pemasok.empty:
-                    top_pemasok_names = df_top5_pemasok['nama_pemasok'].tolist()
+                if not df_top_pemasok.empty:
+                    top_pemasok_names = df_top_pemasok['nama_pemasok'].tolist()
                     df_source = resources['df_source']
                     df_filtered = df_source[df_source['nama_pemasok'].isin(top_pemasok_names)]
                     
